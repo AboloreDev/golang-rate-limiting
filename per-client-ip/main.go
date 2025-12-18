@@ -18,7 +18,6 @@ func init() {
 // Endpoint handler
 func endpointHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	// Message
 	message := Message{
 		Status: "Success",
@@ -35,6 +34,6 @@ func main() {
 
 	mux.Handle("/ping", PerClientRateLimiter(endpointHandler))
 
+	fmt.Println("Server is starting on port 9090")
 	http.ListenAndServe(":9090", mux)
-	fmt.Println("Server is starting on port 8080")
 }
