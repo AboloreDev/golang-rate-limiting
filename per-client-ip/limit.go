@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -10,29 +11,64 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type Visitors struct {
+type Visitor struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time
 }
 
-func PerClientRateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler {
-	var (
-		mutex    sync.Mutex
-		visitors = make(map[string]*Visitors)
-	)
+func (v *Visitor) Allow(now time.Time) bool {
+	v.lastSeen = now
+	return v.limiter.Allow()
+}
 
-	go func() {
-		for {
-			time.Sleep(time.Minute)
-			mutex.Lock()
-			for ip, visitor := range visitors {
-				if time.Since(visitor.lastSeen) > 3*time.Minute {
-					delete(visitors, ip)
-				}
+
+type VisitorLimiter struct {
+	visitors map[string]*Visitor
+	ctx context.Context
+	mutex    sync.RWMutex
+}
+
+func newVisitorLimiter(ctx context.Context) *VisitorLimiter {
+	limiter := &VisitorLimiter{
+		visitors: make(map[string]*Visitor),
+		ctx: ctx,
+	}
+
+	go limiter.runEvictor()
+	return limiter
+}
+
+func (vl *VisitorLimiter) GetVisitor(fingerprint string, fallback *Visitor) *Visitor {
+	vl.mutex.RLock()
+	visitor, found := vl.visitors[fingerprint]
+	vl.mutex.RUnlock()
+	if !found {
+		vl.mutex.Lock()
+		vl.visitors[fingerprint] = fallback
+		defer vl.mutex.Unlock()
+	}
+	return visitor
+}
+
+func (vl *VisitorLimiter) runEvictor() {
+	for {
+		select {
+		case <- time.Tick(time.Minute):
+			for ip, visitor := range vl.visitors {
+			if time.Since(visitor.lastSeen) > 3*time.Minute {
+				vl.mutex.Lock()
+				delete(vl.visitors, ip)
+				vl.mutex.Unlock()
 			}
-			mutex.Unlock()
 		}
-	}()
+		case <-vl.ctx.Done():
+			return
+		}
+	}
+}
+
+func PerClientRateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler {
+	visitorLimiter := newVisitorLimiter(context.Background())
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// get the client ip address
@@ -45,25 +81,18 @@ func PerClientRateLimiter(next func(w http.ResponseWriter, r *http.Request)) htt
 			)
 			return
 		}
-		mutex.Lock()
-		if _, found := visitors[ip]; !found {
-			visitors[ip] = &Visitors{limiter: rate.NewLimiter(2, 4)}
-		}
-		visitors[ip].lastSeen = time.Now()
-		if !visitors[ip].limiter.Allow() {
-			mutex.Unlock()
-
+		visitor := visitorLimiter.GetVisitor(ip, &Visitor{limiter: rate.NewLimiter(2, 4)})
+		if !visitor.Allow(time.Now()) {
 			message := Message{
 				Status: "Request failed",
 				Data:   "Too many request!, please try again later",
 			}
+			w.WriteHeader(http.StatusTooManyRequests)
 			err := json.NewEncoder(w).Encode(&message)
 			if err != nil {
 				return
 			}
-
 		}
-		mutex.Unlock()
 		next(w, r)
 	})
 
